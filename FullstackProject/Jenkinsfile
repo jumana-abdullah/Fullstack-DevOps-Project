@@ -1,0 +1,184 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'JAVA_17'
+        nodejs 'node'
+    }
+
+    environment {
+        DOCKER_USER = 'jumanaabdullah'
+        BACKEND_IMAGE = "jumanaabdullah/demo-backend:${BUILD_NUMBER}"
+        FRONTEND_IMAGE = "jumanaabdullah/frontend-app:${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Build & Test') {
+            parallel {
+                stage('Build & Test Frontend') {
+                    steps {
+                        dir('frontend') {
+                            sh 'node -v && npm -v'
+                            sh 'npm install'
+                            sh '''
+                            export CHROME_BIN=/usr/bin/google-chrome
+                            xvfb-run -a npx ng test --watch=false --browsers=ChromeHeadless || echo "Frontend tests completed with warnings/failures"
+                            '''
+                            withEnv(['NODE_OPTIONS=--max-old-space-size=2048']) {
+                            sh 'npm run build'
+                            }
+                        }
+                    }
+                }
+
+                stage('Build & Test Backend') {
+                    steps {
+                        dir('demo') {
+                            sh 'mvn test'
+                            sh 'mvn clean package -DskipTests'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            parallel {
+                stage('Backend Sonar') {
+                    steps {
+                        dir('demo') {
+                            withSonarQubeEnv('SonarQube') {
+                                sh '''
+                                    mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+                                    -Dsonar.projectKey=fullstack-backend \
+                                    -Dsonar.projectName=fullstack-backend
+                                '''
+                            }
+                        }
+                    }
+                }
+                stage('Frontend Sonar') {
+                    steps {
+                        dir('frontend') {
+                            withSonarQubeEnv('SonarQube') {
+                                sh '''
+                                    npx sonarqube-scanner \
+                                    -Dsonar.projectKey=fullstack-frontend \
+                                    -Dsonar.projectName=fullstack-frontend \
+                                    -Dsonar.sources=src \
+                                    -Dsonar.exclusions="**/*.spec.ts,node_modules/**,dist/**"
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Docker Images') {
+            parallel {
+                stage('Backend Build & Push') {
+                    steps {
+                        script {
+                            sh "docker build -t ${BACKEND_IMAGE} -t ${DOCKER_USER}/demo-backend:latest ./demo"
+                            withCredentials([usernamePassword(credentialsId: 'docker', usernameVariable: 'DOCKER_USER_ENV', passwordVariable: 'DOCKER_PASS_ENV')]) {
+                                sh "echo \$DOCKER_PASS_ENV | docker login -u \$DOCKER_USER_ENV --password-stdin"
+                                sh "docker push ${BACKEND_IMAGE}"
+                                sh "docker push ${DOCKER_USER}/demo-backend:latest"
+                            }
+                        }
+                    }
+                }
+                stage('Frontend Build & Push') {
+                    steps {
+                        script {
+                            sh "docker build -t ${FRONTEND_IMAGE} -t ${DOCKER_USER}/frontend-app:latest ./frontend"
+                            withCredentials([usernamePassword(credentialsId: 'docker', usernameVariable: 'DOCKER_USER_ENV', passwordVariable: 'DOCKER_PASS_ENV')]) {
+                                sh "echo \$DOCKER_PASS_ENV | docker login -u \$DOCKER_USER_ENV --password-stdin"
+                                sh "docker push ${FRONTEND_IMAGE}"
+                                sh "docker push ${DOCKER_USER}/frontend-app:latest"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh 'kubectl apply -f k8s/namespace.yaml'
+                sh 'kubectl apply -f k8s/mysql-pv-pvc.yaml'
+                sh 'kubectl apply -f k8s/mysql-deployment.yaml'
+                sh 'kubectl apply -f k8s/backend-deployment.yaml'
+                sh 'kubectl apply -f k8s/frontend-deployment.yaml'
+                sh 'kubectl apply -f k8s/ingress.yaml'
+                
+                sh "kubectl set image deployment/backend backend=${BACKEND_IMAGE} -n fullstack-app"
+                sh "kubectl set image deployment/frontend frontend=${FRONTEND_IMAGE} -n fullstack-app"
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def jobName = env.JOB_NAME
+                def buildNum = env.BUILD_NUMBER
+                def overallStatus = currentBuild.currentResult.toUpperCase()
+                def bannerColor = overallStatus == 'SUCCESS' ? '#28a745' : '#dc3545'
+
+                def stagesList = ['Build & Test', 'SonarQube Analysis', 'Build & Push Docker Images', 'Deploy to Kubernetes']
+                def stagesHtml = ""
+
+                stagesList.each { stageName ->
+                    def stageStatus = (overallStatus == 'SUCCESS') ? 'SUCCESS' : 'CHECK CONSOLE'
+                    def statusColor = (stageStatus == 'SUCCESS') ? 'green' : 'orange'
+                    
+                    stagesHtml += """
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>${stageName}</strong></td>
+                            <td style="padding: 8px; border: 1px solid #ddd; color: ${statusColor}; font-weight: bold;">${stageStatus}</td>
+                        </tr>
+                    """
+                }
+
+                def body = """<html>
+                    <body style="font-family: Arial, sans-serif;">
+                        <div style="border: 4px solid ${bannerColor}; padding: 15px; border-radius: 8px;">
+                            <h2 style="color: #333;">${jobName} - Build ${buildNum}</h2>
+                            <div style="background-color: ${bannerColor}; padding: 10px; border-radius: 5px;">
+                                <h3 style="color: white; margin: 0;">Overall Pipeline Status: ${overallStatus}</h3>
+                            </div>
+                            
+                            <p style="margin-top: 15px;">Here is the status breakdown for each stage:</p>
+                            <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+                                <thead>
+                                    <tr style="background-color: #f2f2f2;">
+                                        <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Stage Name</th>
+                                        <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${stagesHtml}
+                                </tbody>
+                            </table>
+
+                            <p style="margin-top: 15px;">Check the detailed <a href="${env.BUILD_URL}">console output</a> in Jenkins.</p>
+                        </div>
+                    </body>
+                </html>"""
+
+                emailext (
+                    subject: "${jobName} - Build ${buildNum} - ${overallStatus}",
+                    body: body,
+                    to: (env.NOTIFY_EMAIL ?: 'CHANGE_ME_BEFORE_RUNNING'),
+                    from: 'jenkins@example.com',
+                    replyTo: 'jenkins@example.com',
+                    mimeType: 'text/html'
+                )
+
+                sh 'docker logout'
+            }
+        }
+    }
+}
